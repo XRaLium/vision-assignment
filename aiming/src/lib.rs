@@ -33,21 +33,73 @@ use ui::{Color, Gizmos};
 /// Implement latency compensation, plate selection, and future-position aiming.
 pub fn aim(input: &Input, debug: &mut Gizmos) -> Option<Command> {
     let resolved = input.stats.hits + input.stats.misses;
-    debug.overlay("Hit rate", format!("{}/{resolved}", input.stats.hits));
+    debug.overlay("Hit rate", format!("{}/{}", input.stats.hits, resolved));
 
-    let observation = input.observation?;
-    for plate in observation.target.plates(input.size) {
-        debug.plate(plate, input.size, Color::Cyan);
+    let obs = input.observation?;
+    let age = (input.now_s - obs.time_s).max(0.0);
+    let horizon = age + physics::LAUNCH_DELAY_S;
+
+    let muzzle = physics::MUZZLE_M;
+    let dx = obs.target.x_m - muzzle[0];
+    let dy = obs.target.y_m - muzzle[1];
+    let mut flight = (dx * dx + dy * dy).sqrt() / physics::MUZZLE_SPEED_M_S;
+    if !flight.is_finite() {
+        return None;
     }
 
-    // 1. Find the observation age and account for launch latency.
-    // 2. Select an armor plate before solving its trajectory.
-    // 3. Solve a trajectory with Trajectory::solve.
-    // 4. Aim at the future plate position using age, launch delay, and flight time.
-    // Optional drawings for your solution:
-    // debug.plate(predicted_plate, input.size, Color::Green);
-    // debug.trajectory(trajectory, Color::Orange);
-    None
+    let rough = obs.target.at(horizon + flight).plates(input.size);
+    let mut idx = 0usize;
+    let mut best = f64::NEG_INFINITY;
+    for (i, plate) in rough.iter().enumerate() {
+        let dir = sub(muzzle, plate.center_m);
+        let len = norm(dir);
+        if len < 1e-9 {
+            continue;
+        }
+        let facing = dot(plate.outward_normal, dir) / len;
+        if facing > best {
+            best = facing;
+            idx = i;
+        }
+    }
+    if best <= 0.0 {
+        return None;
+    }
+
+
+    let mut trajectory = None;
+    for _ in 0..10 {
+        let plate = obs.target.at(horizon + flight).plates(input.size)[idx];
+        let traj = Trajectory::solve(plate.center_m)?;
+        let err = (traj.flight_time_s - flight).abs();
+        flight = traj.flight_time_s;
+        trajectory = Some(traj);
+        if err < 1e-4 {
+            break;
+        }
+    }
+    let trajectory = trajectory?;
+    let plate = obs.target.at(horizon + trajectory.flight_time_s).plates(input.size)[idx];
+    let impact = trajectory.position(trajectory.flight_time_s);
+    let miss_m = norm(sub(impact, plate.center_m));
+
+    let v_rel = sub(
+        trajectory.velocity(trajectory.flight_time_s),
+        plate.velocity_m_s,
+    );
+    let score = -dot(plate.outward_normal, v_rel) / norm(v_rel);
+
+    debug.plate(plate, input.size, Color::Green);
+    debug.trajectory(trajectory, Color::Orange);
+    debug.point("Impact", impact, Color::Green);
+    debug.overlay("Flight", format!("{:.0} ms", trajectory.flight_time_s * 1000.0));
+    debug.overlay("Score", format!("{score:.2}"));
+
+    Some(Command {
+        yaw_rad: trajectory.yaw_rad,
+        pitch_rad: trajectory.pitch_rad,
+        fire: score > 0.5 && miss_m < 0.03,
+    })
 }
 
 /// The only simulation data provided to the applicant's controller.
@@ -230,4 +282,19 @@ pub struct Stats {
     pub hits: usize,
     pub misses: usize,
     pub invalid_commands: usize,
+}
+
+/// 向量相减 a - b
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// 向量点积 a·b
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// 向量长度（模）
+fn norm(a: [f64; 3]) -> f64 {
+    dot(a, a).sqrt()
 }
